@@ -8,7 +8,6 @@ import boto3
 import glob
 
 # ── Arguments ────────────────────────────────────────────────────
-# Usage: extract.py <input.json.gz> <output_dir> <r2_prefix>
 if len(sys.argv) != 4:
     print("Usage: extract.py <input.json.gz> <output_dir> <r2_prefix>")
     sys.exit(1)
@@ -58,6 +57,10 @@ with open(pg_path, "w", newline="") as pg_file:
     # ── Stream & flatten ────────────────────────────────────────
     with gzip.open(INPUT_GZ, "rb") as fh:
         for item in ijson.items(fh, "in_network.item"):
+            # Only process items where billing_code_type == "CPT"
+            if item.get("billing_code_type") != "CPT":
+                continue
+
             bc  = item.get("billing_code")
             bct = item.get("billing_code_type")
             na  = item.get("negotiation_arrangement")
