@@ -62,7 +62,7 @@ def get_in_writer(code):
     if len(in_writers) >= MAX_OPEN:
         _evict_one()
     path = os.path.join(OUT_DIR, f"in_network_{code}.csv")
-    f = gzip.open(path, "wt", newline="")
+    f = open(path, "w", newline="")
     w = csv.writer(f)
     w.writerow([
         "npi","negotiated_rate","expiration_date","service_code",
@@ -74,7 +74,7 @@ def get_in_writer(code):
 
 # --- provider_groups output (gzipped) ---
 pg_path = os.path.join(OUT_DIR, "provider_groups.csv")
-pg_f = gzip.open(pg_path, "wt", newline="")
+pg_f = open(pg_path, "w", newline="")
 pg_writer = csv.writer(pg_f)
 pg_writer.writerow(["billing_code","npi","tin_type","tin_value"])
 
@@ -83,7 +83,7 @@ if INPUT_GZ == "-":
     fh = sys.stdin.buffer
 else:
     # larger buffer to reduce syscalls
-    fh = gzip.open(INPUT_GZ, "rb")
+    fh = _py_gzip.open(INPUT_GZ, "rb")
 
 with fh:
     for item in ijson.items(fh, "in_network.item"):
@@ -131,7 +131,7 @@ def _upload(args):
     print(f"Uploading {os.path.basename(path)} -> {key}")
     r2.upload_file(
         path, BUCKET, key,
-        ExtraArgs={"ContentType":"text/csv","ContentEncoding":"gzip"},
+        ExtraArgs={"ContentType":"text/csv"},
         Config=transfer_cfg
     )
     os.remove(path)
