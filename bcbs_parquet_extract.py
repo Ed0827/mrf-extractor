@@ -2,11 +2,13 @@
 """
 CPT-only extractor -> Parquet (denormalized per CPT, Streamlit-friendly)
 
-- Streams giant JSON.GZ via ijson
+- Streams giant JSON.GZ via ijson (yajl2_c backend)
 - Keeps ONLY billing_code_type == "CPT"
 - Handles inline provider_groups; logs unresolved provider_references IDs
 - Writes one Parquet per CPT: parquet/in_network_<CPT>.parquet
-- (Optional) also writes CSV.GZ mirrors per CPT: csv/in_network_<CPT>.csv.gz
+  * If the same CPT appears again later, creates additional parts:
+    parquet/in_network_<CPT>.part1.parquet, part2, ...
+- (Optional) also writes CSV.GZ mirrors per CPT (same part naming)
 - Uploads outputs to Cloudflare R2 (S3-compatible) using env creds
 
 Usage:
@@ -14,6 +16,11 @@ Usage:
 
 Env (required for upload):
   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_ACCESS_KEY_SECRET, R2_BUCKET_NAME
+
+Speed tips:
+  - Install pigz: `sudo apt-get -y install pigz`
+  - Run with larger chunk: `--chunk 300000`
+  - Skip CSV during extraction; export later if needed.
 """
 
 import os
@@ -22,11 +29,17 @@ import csv
 import gzip
 import argparse
 import boto3
-import ijson.backends.yajl2_c as ijson
-import pyarrow as pa
-import pyarrow.parquet as pq
 import subprocess, io
 from collections import defaultdict
+
+# Fast ijson backend
+try:
+    import ijson.backends.yajl2_c as ijson
+except Exception:
+    import ijson  # fallback, slower
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ---------------- CLI ----------------
 def parse_args():
@@ -72,9 +85,10 @@ ARROW_SCHEMA = pa.schema([
 
 # ---------- Writer handles -----------
 class CPTWriter:
-    """Manages Parquet writer + buffer (and optional CSV) per CPT code."""
-    def __init__(self, code, out_dir, also_csv=False):
+    """Manages Parquet writer + buffer (and optional CSV) per CPT code / part file."""
+    def __init__(self, code, out_dir, part_index=0, also_csv=False):
         self.code = code
+        self.part_index = part_index
         self.also_csv = also_csv
 
         # paths
@@ -84,15 +98,20 @@ class CPTWriter:
         if self.also_csv:
             os.makedirs(self.csv_dir, exist_ok=True)
 
-        self.parquet_path = os.path.join(self.parquet_dir, f"in_network_{code}.parquet")
+        base = f"in_network_{code}"
+        if part_index > 0:
+            base = f"{base}.part{part_index}"
+
+        self.parquet_path = os.path.join(self.parquet_dir, f"{base}.parquet")
         self._pq_writer = None  # lazy
         self._buffer = []       # list of dicts
 
         # csv mirror
+        self.csv_path = None
         self._csv_file = None
         self._csv_writer = None
         if self.also_csv:
-            self.csv_path = os.path.join(self.csv_dir, f"in_network_{code}.csv.gz")
+            self.csv_path = os.path.join(self.csv_dir, f"{base}.csv.gz")
             self._csv_file = gzip.open(self.csv_path, "wt", newline="")
             self._csv_writer = csv.writer(self._csv_file)
             self._csv_writer.writerow([c.name for c in ARROW_SCHEMA])
@@ -107,12 +126,18 @@ class CPTWriter:
             return
         table = pa.Table.from_pylist(self._buffer, schema=ARROW_SCHEMA)
         if self._pq_writer is None:
-            self._pq_writer = pq.ParquetWriter(self.parquet_path, ARROW_SCHEMA, compression="snappy",use_dictionary=False, write_statistics=True)
+            # Snappy is fastest; turn off dict encoding for max write throughput
+            self._pq_writer = pq.ParquetWriter(
+                self.parquet_path,
+                ARROW_SCHEMA,
+                compression="snappy",
+                use_dictionary=False
+                # write_statistics=True  # enable if your pyarrow supports it and you want rowgroup stats
+            )
         self._pq_writer.write_table(table)
         self.rows_written += table.num_rows
 
         if self._csv_writer is not None:
-            # write CSV rows in same order as schema
             cols = [c.name for c in ARROW_SCHEMA]
             for r in self._buffer:
                 self._csv_writer.writerow([r.get(col) for col in cols])
@@ -140,12 +165,15 @@ def main():
     # R2 client
     r2, BUCKET = make_r2_client()
 
-    # Writers keyed by CPT code
+    # current open writers keyed by CPT
     writers: dict[str, CPTWriter] = {}
+    # count of parts already produced for a CPT (if CPT appears again later)
+    part_counts = defaultdict(int)
 
     def get_writer(code: str) -> CPTWriter:
         if code not in writers:
-            writers[code] = CPTWriter(code, OUT_DIR, also_csv=args.csv)
+            w = CPTWriter(code, OUT_DIR, part_index=part_counts[code], also_csv=args.csv)
+            writers[code] = w
         return writers[code]
 
     # For memory safety: track per-code buffered counts for flush decisions
@@ -157,107 +185,129 @@ def main():
     unresolved_w = csv.writer(unresolved_f)
     unresolved_w.writerow(["billing_code", "ref_id"])
 
+    # for uploads
+    closed_artifacts: list[tuple[str, str | None]] = []
+
     seen_items = kept_cpt = in_rows = 0
     skipped_ref_rates = skipped_ref_ids = 0
 
     try:
-        proc = subprocess.Popen(["pigz", "-dc", INPUT_GZ], stdout=subprocess.PIPE)
-        fh = io.TextIOWrapper(proc.stdout, encoding="utf-8")  # text stream for ijson
-            for item in ijson.items(fh, "in_network.item"):
-                seen_items += 1
-                bct = (item.get("billing_code_type") or "").upper()
-                if bct != "CPT":
-                    continue
+        # Prefer pigz; fall back to gzip if not available
+        try:
+            proc = subprocess.Popen(["pigz", "-dc", INPUT_GZ], stdout=subprocess.PIPE)
+            fh = io.TextIOWrapper(proc.stdout, encoding="utf-8")  # text stream for ijson
+            use_proc = True
+        except FileNotFoundError:
+            fh = io.TextIOWrapper(gzip.open(INPUT_GZ, "rb"), encoding="utf-8")
+            use_proc = False
 
-                kept_cpt += 1
-                bc  = str(item.get("billing_code") or "")
-                na  = item.get("negotiation_arrangement")
+        for item in ijson.items(fh, "in_network.item"):
+            seen_items += 1
+            bct = (item.get("billing_code_type") or "").upper()
+            if bct != "CPT":
+                continue
 
-                for rate in item.get("negotiated_rates", []) or []:
-                    # Case A: inline provider_groups
-                    pgs = rate.get("provider_groups") or []
-                    if pgs:
-                        # Pre-extract prices once
-                        prices = rate.get("negotiated_prices", []) or []
-                        for pg in pgs:
-                            tin = pg.get("tin", {}) or {}
-                            tin_type = tin.get("type")
-                            tin_val  = tin.get("value")
-                            npis = pg.get("npi", []) or []
+            kept_cpt += 1
+            bc  = str(item.get("billing_code") or "")
+            na  = item.get("negotiation_arrangement")
 
-                            for price in prices:
-                                scodes = "|".join(price.get("service_code", []) or [])
-                                mods   = "|".join(price.get("billing_code_modifier", []) or [])
-                                ntype  = price.get("negotiated_type")
-                                bclass = price.get("billing_class")
-                                rate_val = price.get("negotiated_rate")
-                                exp_date = price.get("expiration_date")
+            for rate in item.get("negotiated_rates", []) or []:
+                # Case A: inline provider_groups
+                pgs = rate.get("provider_groups") or []
+                if pgs:
+                    prices = rate.get("negotiated_prices", []) or []
+                    # Precompute static fields per price
+                    prepped_prices = []
+                    for price in prices:
+                        prepped_prices.append({
+                            "scodes": "|".join(price.get("service_code", []) or []),
+                            "mods":   "|".join(price.get("billing_code_modifier", []) or []),
+                            "ntype":  price.get("negotiated_type"),
+                            "bclass": price.get("billing_class"),
+                            "rate":   price.get("negotiated_rate"),
+                            "exp":    price.get("expiration_date"),
+                        })
 
-                                # Append one row per NPI
-                                for npi in npis:
-                                    row = {
-                                        "npi": str(npi),
-                                        "tin_type": tin_type,
-                                        "tin_value": tin_val,
-                                        "negotiated_rate": float(rate_val) if rate_val is not None else None,
-                                        "expiration_date": exp_date,
-                                        "service_code": scodes,
-                                        "negotiated_type": ntype,
-                                        "billing_class": bclass,
-                                        "billing_code_modifier": mods,
-                                        "billing_code": bc,
-                                        "billing_code_type": bct,
-                                        "negotiation_arrangement": na,
-                                    }
-                                    w = get_writer(bc)
-                                    w.append(row)
-                                    buffered_counts[bc] += 1
-                                    in_rows += 1
+                    for pg in pgs:
+                        tin = pg.get("tin", {}) or {}
+                        tin_type = tin.get("type")
+                        tin_val  = tin.get("value")
+                        npis = pg.get("npi", []) or []
 
-                                    if buffered_counts[bc] >= CHUNK:
-                                        w.flush()
-                                        buffered_counts[bc] = 0
+                        w = get_writer(bc)
+                        for pp in prepped_prices:
+                            for npi in npis:
+                                row = {
+                                    "npi": str(npi),
+                                    "tin_type": tin_type,
+                                    "tin_value": tin_val,
+                                    "negotiated_rate": float(pp["rate"]) if pp["rate"] is not None else None,
+                                    "expiration_date": pp["exp"],
+                                    "service_code": pp["scodes"],
+                                    "negotiated_type": pp["ntype"],
+                                    "billing_class": pp["bclass"],
+                                    "billing_code_modifier": pp["mods"],
+                                    "billing_code": bc,
+                                    "billing_code_type": bct,
+                                    "negotiation_arrangement": na,
+                                }
+                                w.append(row)
+                                buffered_counts[bc] += 1
+                                in_rows += 1
+                                if buffered_counts[bc] >= CHUNK:
+                                    w.flush()
+                                    buffered_counts[bc] = 0
 
-                    # Case B: provider_references (IDs only)
-                    ref_ids = rate.get("provider_references") or []
-                    if ref_ids:
-                        skipped_ref_rates += 1
-                        for rid in ref_ids:
-                            unresolved_w.writerow([bc, rid])
-                            skipped_ref_ids += 1
+                # Case B: provider_references (IDs only)
+                ref_ids = rate.get("provider_references") or []
+                if ref_ids:
+                    skipped_ref_rates += 1
+                    for rid in ref_ids:
+                        unresolved_w.writerow([bc, rid])
+                        skipped_ref_ids += 1
 
-                # Light progress
-                if kept_cpt and kept_cpt % 1000 == 0:
-                    print(f"[progress] CPT items: {kept_cpt:,}  rows: {in_rows:,}")
+            # --- end-of-item: close this CPT writer (keeps FDs low) ---
+            if bc in writers:
+                writers[bc].close()
+                closed_artifacts.append((
+                    writers[bc].parquet_path,
+                    writers[bc].csv_path if args.csv else None
+                ))
+                del writers[bc]
+                buffered_counts.pop(bc, None)
+                part_counts[bc] += 1  # if CPT appears again later, we’ll create .partN
+
+        # finish pigz cleanly
+        if use_proc:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            rc = proc.wait()
+            if rc not in (0, None):
+                raise RuntimeError(f"pigz exited with code {rc}")
 
     finally:
-        # Close all writers
-        for w in writers.values():
+        # Close any stragglers (should be none if we close per CPT)
+        for w in list(writers.values()):
             w.close()
-
+            closed_artifacts.append((w.parquet_path, w.csv_path if args.csv else None))
         unresolved_f.flush()
         unresolved_f.close()
 
     # Upload Parquet & CSV mirrors
-    for w in writers.values():
-        key_parquet = f"{PREFIX}/parquet/{os.path.basename(w.parquet_path)}"
-        print(f"Uploading {w.parquet_path} -> s3://{BUCKET}/{key_parquet}")
-        r2.upload_file(w.parquet_path, BUCKET, key_parquet)
+    for pq_path, csv_path in closed_artifacts:
+        key_parquet = f"{PREFIX}/parquet/{os.path.basename(pq_path)}"
+        print(f"Uploading {pq_path} -> s3://{BUCKET}/{key_parquet}")
+        r2.upload_file(pq_path, BUCKET, key_parquet)
 
-        if args.csv:
-            key_csv = f"{PREFIX}/csv/{os.path.basename(w.csv_path)}"
-            print(f"Uploading {w.csv_path} -> s3://{BUCKET}/{key_csv}")
-            r2.upload_file(w.csv_path, BUCKET, key_csv)
+        if args.csv and csv_path:
+            key_csv = f"{PREFIX}/csv/{os.path.basename(csv_path)}"
+            print(f"Uploading {csv_path} -> s3://{BUCKET}/{key_csv}")
+            r2.upload_file(csv_path, BUCKET, key_csv)
 
     # Upload unresolved refs
     r2.upload_file(unresolved_path, BUCKET, f"{PREFIX}/unresolved_provider_references.csv")
-
-    # Optional: clean local files (uncomment if you want ephemeral runs)
-    # for w in writers.values():
-    #     os.remove(w.parquet_path)
-    #     if args.csv:
-    #         os.remove(w.csv_path)
-    # os.remove(unresolved_path)
 
     print("----- SUMMARY -----")
     print(f"Total in_network items seen: {seen_items:,}")
