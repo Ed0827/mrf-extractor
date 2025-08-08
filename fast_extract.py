@@ -51,7 +51,7 @@ to_upload = []  # (local_path, key)
 def _evict_one():
     code, (w, f, path) = in_writers.popitem(last=False)
     f.flush(); f.close()
-    key = f"{PREFIX}/in_network_{code}.csv.gz"
+    key = f"{PREFIX}/in_network_{code}.csv"
     to_upload.append((path, key))
 
 def get_in_writer(code):
@@ -61,7 +61,7 @@ def get_in_writer(code):
         return w
     if len(in_writers) >= MAX_OPEN:
         _evict_one()
-    path = os.path.join(OUT_DIR, f"in_network_{code}.csv.gz")
+    path = os.path.join(OUT_DIR, f"in_network_{code}.csv")
     f = gzip.open(path, "wt", newline="")
     w = csv.writer(f)
     w.writerow([
@@ -73,7 +73,7 @@ def get_in_writer(code):
     return w
 
 # --- provider_groups output (gzipped) ---
-pg_path = os.path.join(OUT_DIR, "provider_groups.csv.gz")
+pg_path = os.path.join(OUT_DIR, "provider_groups.csv")
 pg_f = gzip.open(pg_path, "wt", newline="")
 pg_writer = csv.writer(pg_f)
 pg_writer.writerow(["billing_code","npi","tin_type","tin_value"])
@@ -121,7 +121,7 @@ with fh:
 
 # Close remaining writers and enqueue uploads
 pg_f.flush(); pg_f.close()
-to_upload.append((pg_path, f"{PREFIX}/provider_groups.csv.gz"))
+to_upload.append((pg_path, f"{PREFIX}/provider_groups.csv"))
 
 while in_writers:
     _evict_one()
