@@ -22,9 +22,10 @@ import csv
 import gzip
 import argparse
 import boto3
-import ijson
+import ijson.backends.yajl2_c as ijson
 import pyarrow as pa
 import pyarrow.parquet as pq
+import subprocess, io
 from collections import defaultdict
 
 # ---------------- CLI ----------------
@@ -106,7 +107,7 @@ class CPTWriter:
             return
         table = pa.Table.from_pylist(self._buffer, schema=ARROW_SCHEMA)
         if self._pq_writer is None:
-            self._pq_writer = pq.ParquetWriter(self.parquet_path, ARROW_SCHEMA, compression="zstd")
+            self._pq_writer = pq.ParquetWriter(self.parquet_path, ARROW_SCHEMA, compression="snappy",use_dictionary=False, write_statistics=True)
         self._pq_writer.write_table(table)
         self.rows_written += table.num_rows
 
@@ -160,7 +161,8 @@ def main():
     skipped_ref_rates = skipped_ref_ids = 0
 
     try:
-        with gzip.open(INPUT_GZ, "rb") as fh:
+        proc = subprocess.Popen(["pigz", "-dc", INPUT_GZ], stdout=subprocess.PIPE)
+        fh = io.TextIOWrapper(proc.stdout, encoding="utf-8")  # text stream for ijson
             for item in ijson.items(fh, "in_network.item"):
                 seen_items += 1
                 bct = (item.get("billing_code_type") or "").upper()
