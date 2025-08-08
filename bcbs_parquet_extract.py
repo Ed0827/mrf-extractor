@@ -1,206 +1,233 @@
 #!/usr/bin/env python3
 """
-CPT-only extractor -> Parquet (denormalized per CPT, Streamlit-friendly)
+CPT-only extractor -> Parquet written DIRECTLY to Cloudflare R2 (no local files)
 
-- Streams giant JSON.GZ via ijson (yajl2_c backend)
+- Streams JSON.GZ via ijson (yajl2_c backend if available; pigz if present)
 - Keeps ONLY billing_code_type == "CPT"
 - Handles inline provider_groups; logs unresolved provider_references IDs
-- Writes one Parquet per CPT: parquet/in_network_<CPT>.parquet
-  * If the same CPT appears again later, creates additional parts:
-    parquet/in_network_<CPT>.part1.parquet, part2, ...
-- (Optional) also writes CSV.GZ mirrors per CPT (same part naming)
-- Uploads outputs to Cloudflare R2 (S3-compatible) using env creds
+- Writes one Parquet per CPT to R2:  <prefix>/parquet/in_network_<CPT>[.partN].parquet
+- Optional fallback: ephemeral local write + immediate upload & delete if direct mode fails
 
 Usage:
-  python3 extract_cigna_cpt_parquet.py <input.json.gz> <output_dir> <r2_prefix> [--csv] [--chunk 100000]
+  python3 extract_cigna_cpt_parquet_to_r2.py <input.json.gz> <r2_prefix> [--chunk 300000] [--fallback-local]
 
-Env (required for upload):
+Required ENV:
   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_ACCESS_KEY_SECRET, R2_BUCKET_NAME
 
-Speed tips:
-  - Install pigz: `sudo apt-get -y install pigz`
-  - Run with larger chunk: `--chunk 300000`
-  - Skip CSV during extraction; export later if needed.
+Notes:
+  * Requires pyarrow >= 11 for S3FileSystem endpoint_override.
+  * If direct-to-R2 fails due to Arrow build, add --fallback-local to write a temp file,
+    upload with boto3, then delete immediately (low disk usage).
 """
 
 import os
 import sys
 import csv
 import gzip
+import io
 import argparse
-import boto3
-import subprocess, io
+import tempfile
+import subprocess
 from collections import defaultdict
 
-# Fast ijson backend
+# Fast ijson backend if present
 try:
     import ijson.backends.yajl2_c as ijson
 except Exception:
-    import ijson  # fallback, slower
+    import ijson  # slower but OK
 
+import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyarrow import fs as pafs
 
-# ---------------- CLI ----------------
+# ------------- CLI -------------
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("input_gz", help="Path to in-network-rates.json.gz")
-    p.add_argument("out_dir", help="Output directory (local)")
     p.add_argument("r2_prefix", help="R2 key prefix, e.g. cigna/2025-08")
-    p.add_argument("--csv", action="store_true", help="Also emit CSV.GZ mirrors")
-    p.add_argument("--chunk", type=int, default=100_000, help="Rows per chunk flush to Parquet")
+    p.add_argument("--chunk", type=int, default=300_000, help="Rows per Parquet flush")
+    p.add_argument("--fallback-local", action="store_true",
+                   help="If direct-to-R2 Parquet write fails, write to temp file, upload, then delete")
     return p.parse_args()
 
-# ------------- R2 client -------------
-def make_r2_client():
+# --------- R2 clients ----------
+def make_r2_clients():
     account = os.environ["R2_ACCOUNT_ID"]
     key     = os.environ["R2_ACCESS_KEY_ID"]
     secret  = os.environ["R2_ACCESS_KEY_SECRET"]
     bucket  = os.environ["R2_BUCKET_NAME"]
-    session = boto3.session.Session()
-    r2 = session.client(
+
+    # boto3 client (for listing/putting small objects, and fallback uploads)
+    s3 = boto3.client(
         "s3",
         region_name="auto",
         endpoint_url=f"https://{account}.r2.cloudflarestorage.com",
         aws_access_key_id=key,
         aws_secret_access_key=secret,
     )
-    return r2, bucket
 
-# ---------- Parquet schema -----------
+    # pyarrow S3 filesystem (for direct Parquet writes)
+    s3fs = pafs.S3FileSystem(
+        access_key=key,
+        secret_key=secret,
+        region="auto",
+        endpoint_override=f"https://{account}.r2.cloudflarestorage.com",
+    )
+
+    return bucket, s3, s3fs
+
+# ------- Parquet schema -------
 ARROW_SCHEMA = pa.schema([
     ("npi",                    pa.string()),
     ("tin_type",               pa.string()),
     ("tin_value",              pa.string()),
     ("negotiated_rate",        pa.float64()),
-    ("expiration_date",        pa.string()),   # keep ISO date as string for Excel-friendliness
-    ("service_code",           pa.string()),   # joined by '|'
+    ("expiration_date",        pa.string()),
+    ("service_code",           pa.string()),
     ("negotiated_type",        pa.string()),
     ("billing_class",          pa.string()),
-    ("billing_code_modifier",  pa.string()),   # joined by '|'
+    ("billing_code_modifier",  pa.string()),
     ("billing_code",           pa.string()),
     ("billing_code_type",      pa.string()),
     ("negotiation_arrangement",pa.string()),
 ])
 
-# ---------- Writer handles -----------
-class CPTWriter:
-    """Manages Parquet writer + buffer (and optional CSV) per CPT code / part file."""
-    def __init__(self, code, out_dir, part_index=0, also_csv=False):
-        self.code = code
-        self.part_index = part_index
-        self.also_csv = also_csv
-
-        # paths
-        self.parquet_dir = os.path.join(out_dir, "parquet")
-        self.csv_dir     = os.path.join(out_dir, "csv")
-        os.makedirs(self.parquet_dir, exist_ok=True)
-        if self.also_csv:
-            os.makedirs(self.csv_dir, exist_ok=True)
-
+# ----- Writer: Direct to R2 (preferred) -----
+class CPTWriterR2:
+    """Write Parquet rowgroups directly to R2 via pyarrow.fs.S3FileSystem."""
+    def __init__(self, bucket: str, s3fs: pafs.S3FileSystem, prefix: str, code: str, part_index: int = 0):
         base = f"in_network_{code}"
         if part_index > 0:
-            base = f"{base}.part{part_index}"
-
-        self.parquet_path = os.path.join(self.parquet_dir, f"{base}.parquet")
-        self._pq_writer = None  # lazy
-        self._buffer = []       # list of dicts
-
-        # csv mirror
-        self.csv_path = None
-        self._csv_file = None
-        self._csv_writer = None
-        if self.also_csv:
-            self.csv_path = os.path.join(self.csv_dir, f"{base}.csv.gz")
-            self._csv_file = gzip.open(self.csv_path, "wt", newline="")
-            self._csv_writer = csv.writer(self._csv_file)
-            self._csv_writer.writerow([c.name for c in ARROW_SCHEMA])
-
+            base += f".part{part_index}"
+        self.key = f"{prefix}/parquet/{base}.parquet"
+        self._buf = []
+        self._writer = None
+        self.s3fs = s3fs
+        self.bucket = bucket
         self.rows_written = 0
 
     def append(self, row: dict):
-        self._buffer.append(row)
+        self._buf.append(row)
 
     def flush(self):
-        if not self._buffer:
+        if not self._buf:
             return
-        table = pa.Table.from_pylist(self._buffer, schema=ARROW_SCHEMA)
-        if self._pq_writer is None:
-            # Snappy is fastest; turn off dict encoding for max write throughput
-            self._pq_writer = pq.ParquetWriter(
-                self.parquet_path,
-                ARROW_SCHEMA,
+        tbl = pa.Table.from_pylist(self._buf, schema=ARROW_SCHEMA)
+        if self._writer is None:
+            # Direct write to "bucket/key" via filesystem param
+            self._writer = pq.ParquetWriter(
+                where=f"{self.bucket}/{self.key.split('/', 1)[1]}",
+                schema=ARROW_SCHEMA,
+                filesystem=self.s3fs,
                 compression="snappy",
-                use_dictionary=False
-                # write_statistics=True  # enable if your pyarrow supports it and you want rowgroup stats
+                use_dictionary=False,
             )
-        self._pq_writer.write_table(table)
-        self.rows_written += table.num_rows
-
-        if self._csv_writer is not None:
-            cols = [c.name for c in ARROW_SCHEMA]
-            for r in self._buffer:
-                self._csv_writer.writerow([r.get(col) for col in cols])
-
-        self._buffer.clear()
+        self._writer.write_table(tbl)
+        self.rows_written += tbl.num_rows
+        self._buf.clear()
 
     def close(self):
         self.flush()
-        if self._pq_writer is not None:
-            self._pq_writer.close()
-        if self._csv_file is not None:
-            self._csv_file.flush()
-            self._csv_file.close()
+        if self._writer is not None:
+            self._writer.close()
 
-# ------------- Main extract ----------
+# ----- Writer: Fallback temp file -> upload -> delete -----
+class CPTWriterFallbackLocal:
+    """Write Parquet to a temp file, upload via boto3, then delete (minimal disk use)."""
+    def __init__(self, bucket: str, s3: boto3.session.Session.client, prefix: str, code: str, part_index: int = 0):
+        base = f"in_network_{code}"
+        if part_index > 0:
+            base += f".part{part_index}"
+        self.key = f"{prefix}/parquet/{base}.parquet"
+        self._buf = []
+        self._writer = None
+        self._tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet")
+        self.tmp_path = self._tmp.name
+        self.s3 = s3
+        self.bucket = bucket
+        self.rows_written = 0
+
+    def append(self, row: dict):
+        self._buf.append(row)
+
+    def flush(self):
+        if not self._buf:
+            return
+        tbl = pa.Table.from_pylist(self._buf, schema=ARROW_SCHEMA)
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(
+                where=self.tmp_path,
+                schema=ARROW_SCHEMA,
+                compression="snappy",
+                use_dictionary=False,
+            )
+        self._writer.write_table(tbl)
+        self.rows_written += tbl.num_rows
+        self._buf.clear()
+
+    def close(self):
+        self.flush()
+        if self._writer is not None:
+            self._writer.close()
+        # Upload then delete
+        self.s3.upload_file(self.tmp_path, self.bucket, self.key)
+        try:
+            os.remove(self.tmp_path)
+        except FileNotFoundError:
+            pass
+
+# ------------- Main -------------
 def main():
     args = parse_args()
     INPUT_GZ = args.input_gz
-    OUT_DIR  = args.out_dir
     PREFIX   = args.r2_prefix
-    CHUNK    = max(1_000, args.chunk)  # be reasonable
+    CHUNK    = max(1_000, args.chunk)
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    bucket, s3, s3fs = make_r2_clients()
 
-    # R2 client
-    r2, BUCKET = make_r2_client()
+    # choose writer factory
+    def make_writer(code: str, part_idx: int, direct_ok: bool):
+        if direct_ok:
+            return CPTWriterR2(bucket, s3fs, PREFIX, code, part_idx)
+        else:
+            return CPTWriterFallbackLocal(bucket, s3, PREFIX, code, part_idx)
 
-    # current open writers keyed by CPT
-    writers: dict[str, CPTWriter] = {}
-    # count of parts already produced for a CPT (if CPT appears again later)
+    # probe direct mode once
+    direct_ok = True
+    try:
+        # lightweight probe: open/close a dummy output stream then delete it
+        probe_key = f"{PREFIX}/_probe/delete_me.txt"
+        with s3fs.open_output_stream(f"{bucket}/{probe_key}") as out:
+            out.write(b"ok")
+        s3.delete_object(Bucket=bucket, Key=probe_key)
+    except Exception as e:
+        direct_ok = False
+        if not args.fallback_local:
+            print("❌ Direct-to-R2 Parquet not available in this environment.")
+            print("   Try: pip install --upgrade pyarrow  (>= 11), or run with --fallback-local.")
+            raise
+
+    # unresolved provider_references → keep in memory and upload at end
+    unresolved_rows = [("billing_code", "ref_id")]
+
+    # streaming counters
     part_counts = defaultdict(int)
-
-    def get_writer(code: str) -> CPTWriter:
-        if code not in writers:
-            w = CPTWriter(code, OUT_DIR, part_index=part_counts[code], also_csv=args.csv)
-            writers[code] = w
-        return writers[code]
-
-    # For memory safety: track per-code buffered counts for flush decisions
+    writers = {}
     buffered_counts = defaultdict(int)
-
-    # Unresolved provider refs → log & skip
-    unresolved_path = os.path.join(OUT_DIR, "unresolved_provider_references.csv")
-    unresolved_f = open(unresolved_path, "w", newline="")
-    unresolved_w = csv.writer(unresolved_f)
-    unresolved_w.writerow(["billing_code", "ref_id"])
-
-    # for uploads
-    closed_artifacts: list[tuple[str, str | None]] = []
-
     seen_items = kept_cpt = in_rows = 0
     skipped_ref_rates = skipped_ref_ids = 0
 
+    # input stream: pigz if available, else gzip
+    use_proc = False
     try:
-        # Prefer pigz; fall back to gzip if not available
-        try:
-            proc = subprocess.Popen(["pigz", "-dc", INPUT_GZ], stdout=subprocess.PIPE)
-            fh = io.TextIOWrapper(proc.stdout, encoding="utf-8")  # text stream for ijson
-            use_proc = True
-        except FileNotFoundError:
-            fh = io.TextIOWrapper(gzip.open(INPUT_GZ, "rb"), encoding="utf-8")
-            use_proc = False
+        proc = subprocess.Popen(["pigz", "-dc", INPUT_GZ], stdout=subprocess.PIPE)
+        fh = io.TextIOWrapper(proc.stdout, encoding="utf-8")
+        use_proc = True
+    except FileNotFoundError:
+        fh = io.TextIOWrapper(gzip.open(INPUT_GZ, "rb"), encoding="utf-8")
 
+    try:
         for item in ijson.items(fh, "in_network.item"):
             seen_items += 1
             bct = (item.get("billing_code_type") or "").upper()
@@ -212,21 +239,26 @@ def main():
             na  = item.get("negotiation_arrangement")
 
             for rate in item.get("negotiated_rates", []) or []:
-                # Case A: inline provider_groups
+                # inline provider_groups
                 pgs = rate.get("provider_groups") or []
                 if pgs:
                     prices = rate.get("negotiated_prices", []) or []
-                    # Precompute static fields per price
-                    prepped_prices = []
-                    for price in prices:
-                        prepped_prices.append({
-                            "scodes": "|".join(price.get("service_code", []) or []),
-                            "mods":   "|".join(price.get("billing_code_modifier", []) or []),
-                            "ntype":  price.get("negotiated_type"),
-                            "bclass": price.get("billing_class"),
-                            "rate":   price.get("negotiated_rate"),
-                            "exp":    price.get("expiration_date"),
-                        })
+                    prepped = [
+                        {
+                            "scodes": "|".join(p.get("service_code", []) or []),
+                            "mods":   "|".join(p.get("billing_code_modifier", []) or []),
+                            "ntype":  p.get("negotiated_type"),
+                            "bclass": p.get("billing_class"),
+                            "rate":   p.get("negotiated_rate"),
+                            "exp":    p.get("expiration_date"),
+                        }
+                        for p in prices
+                    ]
+
+                    if bc not in writers:
+                        writers[bc] = make_writer(bc, part_counts[bc], direct_ok)
+
+                    w = writers[bc]
 
                     for pg in pgs:
                         tin = pg.get("tin", {}) or {}
@@ -234,10 +266,9 @@ def main():
                         tin_val  = tin.get("value")
                         npis = pg.get("npi", []) or []
 
-                        w = get_writer(bc)
-                        for pp in prepped_prices:
+                        for pp in prepped:
                             for npi in npis:
-                                row = {
+                                w.append({
                                     "npi": str(npi),
                                     "tin_type": tin_type,
                                     "tin_value": tin_val,
@@ -250,34 +281,33 @@ def main():
                                     "billing_code": bc,
                                     "billing_code_type": bct,
                                     "negotiation_arrangement": na,
-                                }
-                                w.append(row)
+                                })
                                 buffered_counts[bc] += 1
                                 in_rows += 1
                                 if buffered_counts[bc] >= CHUNK:
                                     w.flush()
                                     buffered_counts[bc] = 0
 
-                # Case B: provider_references (IDs only)
+                # provider_references IDs (unresolved here)
                 ref_ids = rate.get("provider_references") or []
                 if ref_ids:
                     skipped_ref_rates += 1
                     for rid in ref_ids:
-                        unresolved_w.writerow([bc, rid])
+                        unresolved_rows.append((bc, str(rid)))
                         skipped_ref_ids += 1
 
-            # --- end-of-item: close this CPT writer (keeps FDs low) ---
+            # end of this CPT item: close writer, advance part index
             if bc in writers:
                 writers[bc].close()
-                closed_artifacts.append((
-                    writers[bc].parquet_path,
-                    writers[bc].csv_path if args.csv else None
-                ))
                 del writers[bc]
                 buffered_counts.pop(bc, None)
-                part_counts[bc] += 1  # if CPT appears again later, we’ll create .partN
+                part_counts[bc] += 1
 
-        # finish pigz cleanly
+            if kept_cpt and kept_cpt % 1000 == 0:
+                print(f"[progress] CPT items: {kept_cpt:,}  rows: {in_rows:,}")
+
+    finally:
+        # close pigz cleanly
         if use_proc:
             try:
                 proc.stdout.close()
@@ -287,27 +317,22 @@ def main():
             if rc not in (0, None):
                 raise RuntimeError(f"pigz exited with code {rc}")
 
-    finally:
-        # Close any stragglers (should be none if we close per CPT)
+        # close any stragglers (shouldn't be any)
         for w in list(writers.values()):
             w.close()
-            closed_artifacts.append((w.parquet_path, w.csv_path if args.csv else None))
-        unresolved_f.flush()
-        unresolved_f.close()
 
-    # Upload Parquet & CSV mirrors
-    for pq_path, csv_path in closed_artifacts:
-        key_parquet = f"{PREFIX}/parquet/{os.path.basename(pq_path)}"
-        print(f"Uploading {pq_path} -> s3://{BUCKET}/{key_parquet}")
-        r2.upload_file(pq_path, BUCKET, key_parquet)
-
-        if args.csv and csv_path:
-            key_csv = f"{PREFIX}/csv/{os.path.basename(csv_path)}"
-            print(f"Uploading {csv_path} -> s3://{BUCKET}/{key_csv}")
-            r2.upload_file(csv_path, BUCKET, key_csv)
-
-    # Upload unresolved refs
-    r2.upload_file(unresolved_path, BUCKET, f"{PREFIX}/unresolved_provider_references.csv")
+    # Upload unresolved CSV (small) directly from memory
+    if len(unresolved_rows) > 1:
+        from io import StringIO
+        sio = StringIO()
+        cw = csv.writer(sio)
+        cw.writerows(unresolved_rows)
+        body = sio.getvalue().encode("utf-8")
+        key = f"{PREFIX}/unresolved_provider_references.csv"
+        s3.put_object(Bucket=bucket, Key=key, Body=body)
+        print(f"Uploaded unresolved refs -> s3://{bucket}/{key}")
+    else:
+        print("No unresolved provider_references found.")
 
     print("----- SUMMARY -----")
     print(f"Total in_network items seen: {seen_items:,}")
@@ -315,7 +340,7 @@ def main():
     print(f"in_network rows written:    {in_rows:,}")
     print(f"rates with provider_refs:   {skipped_ref_rates:,}")
     print(f"unresolved ref IDs logged:  {skipped_ref_ids:,}")
-    print("✅ Done.")
+    print("✅ Done (direct-to-R2).")
 
 if __name__ == "__main__":
     main()
