@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-CPT-only extractor -> CSV.GZ per CPT, uploads to Cloudflare R2.
+CPT-only extractor -> CSV per CPT, uploads to Cloudflare R2.
 
-- Streams JSON.GZ via ijson (uses yajl2_c backend if available; pigz if present)
+- Streams JSON.GZ via ijson (yajl2_c backend if available; pigz if present)
 - Filters ONLY billing_code_type == "CPT"
 - Handles inline provider_groups (NPI/TIN)
-- Outputs: csv/in_network_<CPT>.csv.gz  (or .partN if CPT repeats)
+- Outputs: csv/in_network_<CPT>.csv  (or .partN if CPT repeats)
 - Logs unresolved provider_references to unresolved_provider_references.csv
 - Uploads to R2 either at the end or immediately per CPT with --ephemeral
 
@@ -67,7 +67,7 @@ def make_r2_client():
 
 # ---------- CSV writer -----------
 class CPTCSVWriter:
-    """CSV.GZ writer for a single CPT (and part index if repeats)."""
+    """Plain CSV writer for a single CPT (and part index if repeats)."""
     HEADER = [
         "npi","tin_type","tin_value",
         "negotiated_rate","expiration_date","service_code",
@@ -78,8 +78,9 @@ class CPTCSVWriter:
         self.code = code
         base = f"in_network_{code}" + (f".part{part_index}" if part_index > 0 else "")
         os.makedirs(os.path.join(out_dir, "csv"), exist_ok=True)
-        self.path = os.path.join(out_dir, "csv", base + ".csv.gz")
-        self._fh = gzip.open(self.path, "wt", newline="")
+        self.path = os.path.join(out_dir, "csv", base + ".csv")
+        # Write UTF-8 with newline='' to avoid extra CRLFs on Windows
+        self._fh = open(self.path, "w", newline="", encoding="utf-8")
         self._w = csv.writer(self._fh)
         self._w.writerow(self.HEADER)
         self.rows = 0
@@ -112,7 +113,7 @@ def main():
 
     # unresolved provider refs → log & upload at end
     unresolved_path = os.path.join(OUT_DIR, "unresolved_provider_references.csv")
-    unresolved_f = open(unresolved_path, "w", newline="")
+    unresolved_f = open(unresolved_path, "w", newline="", encoding="utf-8")
     unresolved_w = csv.writer(unresolved_f)
     unresolved_w.writerow(["billing_code", "ref_id"])
 
