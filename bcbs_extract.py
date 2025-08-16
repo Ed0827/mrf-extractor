@@ -132,7 +132,7 @@ def main():
         return writers[code]
 
     def upload_and_maybe_delete(local_path: str):
-        key = f"{PREFIX}/csv/{os.path.basename(local_path)}"
+        key = f"{PREFIX}/{os.path.basename(local_path)}"
         print(f"Uploading {local_path} -> s3://{BUCKET}/{key}")
         r2.upload_file(local_path, BUCKET, key)
         os.remove(local_path)
@@ -249,7 +249,7 @@ def main():
     # Upload any deferred CSVs (non-ephemeral mode)
     if not args.ephemeral:
         for path in closed_paths:
-            key = f"{PREFIX}/csv/{os.path.basename(path)}"
+            key = f"{PREFIX}/{os.path.basename(path)}"
             print(f"Uploading {path} -> s3://{BUCKET}/{key}")
             r2.upload_file(path, BUCKET, key)
 
