@@ -211,9 +211,7 @@ def process_one_file(
             seen_items += 1
 
             # Fast early filters
-            bct = str(item.get("billing_code_type", "")).strip().upper()
-            if not bct.startswith("CPT"):
-                continue
+            bct = str(item.get("billing_code_type", "")).strip()
 
             bc = str(item.get("billing_code", "")).strip()
             if not bc:
